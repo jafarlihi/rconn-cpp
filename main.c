@@ -4,6 +4,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <unistd.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -130,13 +131,26 @@ int main(int argc, char *argv[]) {
 
     pthread_create(&remote_read_thread, NULL, &read_thread, (void *)(&(thread_args_t){.local = false, .conn_fd = conn_fd}));
     pthread_create(&local_read_thread, NULL, &read_thread, (void *)(&(thread_args_t){.local = true, .conn_fd = local_conn_fd}));
-    pthread_create(&remote_read_thread, NULL, &write_thread, (void *)(&(thread_args_t){.local = false, .conn_fd = local_conn_fd}));
-    pthread_create(&local_read_thread, NULL, &write_thread, (void *)(&(thread_args_t){.local = true, .conn_fd = conn_fd}));
+    pthread_create(&remote_write_thread, NULL, &write_thread, (void *)(&(thread_args_t){.local = false, .conn_fd = local_conn_fd}));
+    pthread_create(&local_write_thread, NULL, &write_thread, (void *)(&(thread_args_t){.local = true, .conn_fd = conn_fd}));
 
-    pthread_join(remote_read_thread, NULL);
     pthread_join(local_read_thread, NULL);
-    pthread_join(remote_write_thread, NULL);
-    pthread_join(local_write_thread, NULL);
+    if (!strcmp(argv[1], "-s")) {
+        for (;;) {
+            pthread_cancel(remote_write_thread);
+
+            local_conn_fd = server_accept(local_fd, true);
+            if (local_conn_fd == -1) {
+                printf("Failed accepting connection, err: %s\n", strerror(err));
+                continue;
+            }
+
+            pthread_create(&local_read_thread, NULL, &read_thread, (void *)(&(thread_args_t){.local = true, .conn_fd = local_conn_fd}));
+            pthread_create(&remote_write_thread, NULL, &write_thread, (void *)(&(thread_args_t){.local = false, .conn_fd = local_conn_fd}));
+
+            pthread_join(local_read_thread, NULL);
+        }
+    }
 
     pthread_mutex_destroy(&buffer_lock);
 }
@@ -259,9 +273,7 @@ void *write_thread(void *args) {
 
             sent += send_resp;
         }
-        pthread_mutex_unlock(&buffer_lock);
 
-        pthread_mutex_lock(&buffer_lock);
         if (!arguments->local)
             buffer->remote_to_local_read = true;
         else
