@@ -2,9 +2,10 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
+#include <thread>
 #include <pthread.h>
+#include <mutex>
 #include <unistd.h>
-#include <signal.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -26,17 +27,17 @@ typedef struct thread_args {
 int server_listen(int socket_fd, int port, bool local);
 int server_accept(int socket_fd, bool local);
 
-void *read_thread(void *args);
-void *write_thread(void *args);
+void *read_thread(bool local, int conn_fd);
+void *write_thread(bool local, int conn_fd);
 
 buffer_t *buffer;
-pthread_mutex_t buffer_lock;
+std::mutex buffer_lock;
 
 int main(int argc, char *argv[]) {
     int err = 0;
     int conn_fd = -1, local_conn_fd = -1;
     int remote_fd, local_fd;
-    buffer = malloc(sizeof(buffer_t));
+    buffer = (buffer_t *)malloc(sizeof(buffer_t));
 
     err = (remote_fd = socket(AF_INET, SOCK_STREAM, 0));
     if (err == -1) {
@@ -121,23 +122,20 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
 
-    err = pthread_mutex_init(&buffer_lock, NULL);
-    if (err != 0) {
-        printf("pthread_mutex_init failed, err: %s\n", strerror(err));
-        return err;
-    }
+    std::thread remote_read_thread(read_thread, false, conn_fd);
+    std::thread local_read_thread(read_thread, true, local_conn_fd);
+    std::thread remote_write_thread(write_thread, false, local_conn_fd);
+    std::thread local_write_thread(write_thread, true, conn_fd);
 
-    pthread_t remote_read_thread, local_read_thread, remote_write_thread, local_write_thread;
-
-    pthread_create(&remote_read_thread, NULL, &read_thread, (void *)(&(thread_args_t){.local = false, .conn_fd = conn_fd}));
-    pthread_create(&local_read_thread, NULL, &read_thread, (void *)(&(thread_args_t){.local = true, .conn_fd = local_conn_fd}));
-    pthread_create(&remote_write_thread, NULL, &write_thread, (void *)(&(thread_args_t){.local = false, .conn_fd = local_conn_fd}));
-    pthread_create(&local_write_thread, NULL, &write_thread, (void *)(&(thread_args_t){.local = true, .conn_fd = conn_fd}));
-
-    pthread_join(local_read_thread, NULL);
+    local_read_thread.join();
     if (!strcmp(argv[1], "-s")) {
         for (;;) {
-            pthread_cancel(remote_write_thread);
+#ifndef _WIN32
+            pthread_cancel(remote_write_thread.native_handle());
+#else
+            TerminateThread(remote_write_thread.native_handle());
+#endif
+            remote_write_thread.join();
 
             local_conn_fd = server_accept(local_fd, true);
             if (local_conn_fd == -1) {
@@ -145,14 +143,12 @@ int main(int argc, char *argv[]) {
                 continue;
             }
 
-            pthread_create(&local_read_thread, NULL, &read_thread, (void *)(&(thread_args_t){.local = true, .conn_fd = local_conn_fd}));
-            pthread_create(&remote_write_thread, NULL, &write_thread, (void *)(&(thread_args_t){.local = false, .conn_fd = local_conn_fd}));
+            local_read_thread = std::thread(read_thread, true, local_conn_fd);
+            remote_write_thread = std::thread(write_thread, false, local_conn_fd);
 
-            pthread_join(local_read_thread, NULL);
+            local_read_thread.join();
         }
     }
-
-    pthread_mutex_destroy(&buffer_lock);
 }
 
 int server_listen(int socket_fd, int port, bool local) {
@@ -201,15 +197,14 @@ int server_accept(int socket_fd, bool local) {
     return conn_fd;
 }
 
-void *read_thread(void *args) {
-    thread_args_t *arguments = (thread_args_t *)args;
+void *read_thread(bool local, int conn_fd) {
     char *read_buffer[1024];
 
     for (;;) {
-        int recv_resp = recv(arguments->conn_fd, read_buffer, 1024, 0);
+        int recv_resp = recv(conn_fd, read_buffer, 1024, 0);
 
         if (recv_resp == 0) {
-            if (!arguments->local)
+            if (!local)
                 printf("Remote port connection has been closed\n");
             else
                 printf("Local port connection has been closed\n");
@@ -222,15 +217,15 @@ void *read_thread(void *args) {
         }
 
         for (;;) {
-            if (!arguments->local && buffer->remote_to_local_read)
+            if (!local && buffer->remote_to_local_read)
                 break;
-            if (arguments->local && buffer->local_to_remote_read)
+            if (local && buffer->local_to_remote_read)
                 break;
             sleep(1);
         }
 
-        pthread_mutex_lock(&buffer_lock);
-        if (!arguments->local) {
+        buffer_lock.lock();
+        if (!local) {
             buffer->remote_to_local_buffer = read_buffer;
             buffer->remote_to_local_len = recv_resp;
             buffer->remote_to_local_read = false;
@@ -239,19 +234,17 @@ void *read_thread(void *args) {
             buffer->local_to_remote_len = recv_resp;
             buffer->local_to_remote_read = false;
         }
-        pthread_mutex_unlock(&buffer_lock);
+        buffer_lock.unlock();
     }
 }
 
-void *write_thread(void *args) {
-    thread_args_t *arguments = (thread_args_t *)args;
-
+void *write_thread(bool local, int conn_fd) {
     for (;;) {
-        if (!arguments->local && buffer->remote_to_local_read) {
+        if (!local && buffer->remote_to_local_read) {
             sleep(1);
             continue;
         }
-        if (arguments->local && buffer->local_to_remote_read) {
+        if (local && buffer->local_to_remote_read) {
             sleep(1);
             continue;
         }
@@ -259,12 +252,12 @@ void *write_thread(void *args) {
         int send_resp;
         int sent = 0;
 
-        pthread_mutex_lock(&buffer_lock);
-        while ((!arguments->local && sent != buffer->remote_to_local_len) || (arguments->local && sent != buffer->local_to_remote_len)) {
-            if (!arguments->local)
-                send_resp = send(arguments->conn_fd, buffer->remote_to_local_buffer + sent, buffer->remote_to_local_len - sent, 0);
+        buffer_lock.lock();
+        while ((!local && sent != buffer->remote_to_local_len) || (local && sent != buffer->local_to_remote_len)) {
+            if (!local)
+                send_resp = send(conn_fd, ((char *)(buffer->remote_to_local_buffer)) + sent, buffer->remote_to_local_len - sent, 0);
             else
-                send_resp = send(arguments->conn_fd, buffer->local_to_remote_buffer + sent, buffer->local_to_remote_len - sent, 0);
+                send_resp = send(conn_fd, ((char *)(buffer->local_to_remote_buffer)) + sent, buffer->local_to_remote_len - sent, 0);
 
             if (send_resp == -1) {
                 printf("send failed, err: %s\n", strerror(send_resp));
@@ -274,10 +267,10 @@ void *write_thread(void *args) {
             sent += send_resp;
         }
 
-        if (!arguments->local)
+        if (!local)
             buffer->remote_to_local_read = true;
         else
             buffer->local_to_remote_read = true;
-        pthread_mutex_unlock(&buffer_lock);
+        buffer_lock.unlock();
     }
 }
